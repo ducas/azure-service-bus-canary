@@ -1,0 +1,10 @@
+version: "3"
+
+services:
+  job:
+    image: sb-canary
+    build:
+      context: ./SBCanary
+      dockerfile: Dockerfile
+    environment:
+      Logging:LogLevel:Default: Information

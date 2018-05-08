@@ -31,7 +31,7 @@ namespace SBCanary
             LoggerFactory = new LoggerFactory().AddConsole(config.GetSection("Logging"));
             var logger = LoggerFactory.CreateLogger("Main");
 
-            logger.LogInformation("Starting...");
+            logger.LogInformation($"Starting with environment {environment} and log level {config["Logging:LogLevel:Default"]}.");
             try
             {
                 var app = new Program(config["ServiceBus:ConnectionString"], config["ServiceBus:TopicName"], config["ServiceBus:SubscriptionName"]);
@@ -68,6 +68,7 @@ namespace SBCanary
 
         private CancellationTokenSource cts;
         private ManualResetEventSlim stopped;
+        private SubscriptionClient subscriber;
         public async Task Run()
         {
             if (cts != null) throw new InvalidOperationException("Already running!");
@@ -75,14 +76,13 @@ namespace SBCanary
             cts = new CancellationTokenSource();
             stopped = new ManualResetEventSlim();
 
-            var client = new SubscriptionClient(connectionString, topicName, subscriptionName);
-            StartSubscriber(client);
-
+            subscriber = StartSubscriber();
             var publisher = StartPublisher(cts.Token);
             var watcher = StartWatcher(cts.Token);
 
             await Task.WhenAny(new[] { publisher, watcher });
-            await client.CloseAsync();
+
+            await subscriber.CloseAsync();
 
             cts = null;
         }
@@ -92,48 +92,64 @@ namespace SBCanary
             cts.Cancel();
         }
 
+        DateTimeOffset lastSent = DateTimeOffset.UtcNow;
         private async Task StartPublisher(CancellationToken token)
         {
             var logger = LoggerFactory.CreateLogger("Publisher");
-            var client = new TopicClient(connectionString, topicName);
-            while (!token.IsCancellationRequested)
+            logger.LogInformation("Publisher starting...");
+            try
             {
-                var body = DateTimeOffset.UtcNow;
-                await client.SendAsync(new Message()
+                var client = new TopicClient(connectionString, topicName);
+                while (!token.IsCancellationRequested)
                 {
-                    Body = Encoding.Unicode.GetBytes(body.ToString("o"))
-                });
-                var took = (DateTimeOffset.UtcNow - body).TotalMilliseconds;
-                logger.LogDebug($"Sent {body:o}, took {took}ms.");
-                await Task.Delay(100);
+                    var body = DateTimeOffset.UtcNow;
+                    await client.SendAsync(new Message()
+                    {
+                        Body = Encoding.Unicode.GetBytes(body.ToString("o"))
+                    });
+                    var took = (DateTimeOffset.UtcNow - body).TotalMilliseconds;
+                    logger.LogDebug($"Sent {body:o}, took {took}ms.");
+                    lastSent = body;
+                    await Task.Delay(100);
+                }
+            }
+            catch (Exception ex)
+            {
+                logger.LogCritical(ex, "Publisher failed to publish message.");
             }
             logger.LogInformation("Publisher stopped");
         }
 
         DateTimeOffset lastReceived = DateTimeOffset.MinValue;
-        private void StartSubscriber(SubscriptionClient client)
+        DateTimeOffset lastReceivedTime = DateTimeOffset.MinValue;
+        private SubscriptionClient StartSubscriber()
         {
             var logger = LoggerFactory.CreateLogger("Subscriber");
+            var client = new SubscriptionClient(connectionString, topicName, subscriptionName);
             lastReceived = DateTimeOffset.UtcNow;
+            lastReceivedTime = DateTimeOffset.UtcNow;
+
             logger.LogDebug("Starting subscriber...");
             client.RegisterMessageHandler(
                 (message, cancellationToken) =>
                 {
                     var time = DateTimeOffset.UtcNow;
-                    logger.LogTrace(Newtonsoft.Json.JsonConvert.SerializeObject(message));
                     var body = Encoding.Unicode.GetString(message.Body);
                     var sent = DateTimeOffset.Parse(body);
                     var totalMs = (time - sent).TotalMilliseconds;
                     logger.LogDebug($"{totalMs}ms");
                     if (sent > lastReceived) lastReceived = sent;
+                    lastReceivedTime = time;
                     return Task.CompletedTask;
                 },
                 new MessageHandlerOptions((e) => LogMessageHandlerException(logger, e))
                 {
                     AutoComplete = true,
-                    MaxConcurrentCalls = 1
+                    MaxConcurrentCalls = 100
                 }
             );
+
+            return client;
         }
 
         private Task LogMessageHandlerException(ILogger l, ExceptionReceivedEventArgs e)
@@ -177,6 +193,12 @@ namespace SBCanary
                 {
                     logger.LogInformation($"OK - {delay.TotalMilliseconds}ms");
                     lastThreshold = TimeSpan.Zero;
+                }
+
+                if (lastSent - lastReceivedTime > TimeSpan.FromSeconds(10)) {
+                    logger.LogWarning("Subscriber stuck. Restarting...");
+                    await subscriber.CloseAsync();
+                    subscriber = StartSubscriber();
                 }
 
                 await Task.Delay(watchSleepTime);
